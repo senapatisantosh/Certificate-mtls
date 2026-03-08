@@ -1,0 +1,276 @@
+# =============================================================================
+# Kubernetes Deployment for Dapr Service with mTLS
+# =============================================================================
+#
+# Key annotations:
+#   dapr.io/enabled: "true"    → Inject Dapr sidecar
+#   dapr.io/app-id: "..."      → Becomes SPIFFE identity
+#   dapr.io/app-port: "5000"   → Where sidecar forwards traffic
+#   dapr.io/config: "..."      → Access control configuration
+#
+# The Dapr sidecar injector (MutatingWebhook) automatically adds:
+#   - daprd container (sidecar)
+#   - Volume mounts for trust bundle
+#   - Environment variables for Dapr ports
+#
+# mTLS flow:
+#   1. Pod starts → sidecar generates key pair
+#   2. Sidecar sends CSR to Sentry (via Kubernetes ServiceAccount token)
+#   3. Sentry validates SA token with K8s API
+#   4. Sentry signs workload cert with SPIFFE ID:
+#      spiffe://cluster.local/ns/production/order-service
+#   5. Sidecar stores cert in memory (never on disk!)
+#   6. All sidecar-to-sidecar traffic uses mTLS
+#   7. Cert auto-rotates at 70% of TTL (default: ~17 hours into 24h cert)
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: production
+  labels:
+    app: order-service
+    version: v1
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+        version: v1
+      annotations:
+        # ─── Dapr Sidecar Injection ───
+        dapr.io/enabled: "true"
+        dapr.io/app-id: "order-service"         # → SPIFFE ID: spiffe://cluster.local/ns/production/order-service
+        dapr.io/app-port: "5000"                 # Your app's port (sidecar forwards here)
+        dapr.io/config: "mtls-access-control"    # Reference to access control config
+        dapr.io/log-level: "info"
+
+        # ─── Sidecar Resource Limits ───
+        dapr.io/sidecar-cpu-request: "100m"
+        dapr.io/sidecar-memory-request: "128Mi"
+        dapr.io/sidecar-cpu-limit: "300m"
+        dapr.io/sidecar-memory-limit: "256Mi"
+
+        # ─── mTLS Settings (override defaults) ───
+        # These are usually set globally in the Dapr Configuration, but can be
+        # overridden per-app via annotations
+        dapr.io/enable-mtls: "true"              # Explicit mTLS enable (default: true)
+
+    spec:
+      serviceAccountName: order-service          # Used by Sentry for identity verification
+      containers:
+        - name: order-service
+          image: myregistry/order-service:latest
+          ports:
+            - containerPort: 5000
+              name: http
+              protocol: TCP
+          env:
+            # App listens on plain HTTP - sidecar handles TLS!
+            - name: ASPNETCORE_URLS
+              value: "http://+:5000"
+            - name: ASPNETCORE_ENVIRONMENT
+              value: "Production"
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+
+---
+# Service for the deployment
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+  namespace: production
+  labels:
+    app: order-service
+spec:
+  selector:
+    app: order-service
+  ports:
+    - port: 80
+      targetPort: 5000
+      protocol: TCP
+      name: http
+  type: ClusterIP
+
+---
+# ServiceAccount (used by Dapr Sentry for identity verification)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: order-service
+  namespace: production
+
+---
+# =============================================================================
+# Dapr Configuration with Access Control
+# =============================================================================
+# This defines WHO can call this service and WHAT endpoints they can access.
+# Access control uses SPIFFE identities from mTLS certificates.
+apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: mtls-access-control
+  namespace: production
+spec:
+  # ─── mTLS Settings ───
+  mtls:
+    enabled: true
+    workloadCertTTL: "24h"          # Workload cert lifetime
+    allowedClockSkew: "15m"         # Tolerance for clock drift
+
+  # ─── Access Control ───
+  accessControl:
+    defaultAction: deny             # DENY by default (zero trust!)
+    trustDomain: "cluster.local"
+
+    policies:
+      # Allow payment-service to call us (for callbacks)
+      - appId: payment-service
+        defaultAction: deny
+        trustDomain: "cluster.local"
+        namespace: "production"
+        operations:
+          - name: /payment-result
+            httpVerb: ["POST"]
+            action: allow
+
+      # Allow API gateway to create orders
+      - appId: api-gateway
+        defaultAction: deny
+        trustDomain: "cluster.local"
+        namespace: "production"
+        operations:
+          - name: /orders
+            httpVerb: ["POST"]
+            action: allow
+          - name: /orders/*
+            httpVerb: ["GET"]
+            action: allow
+          - name: /health
+            httpVerb: ["GET"]
+            action: allow
+
+      # Allow monitoring to check health
+      - appId: monitoring-service
+        defaultAction: deny
+        trustDomain: "cluster.local"
+        namespace: "monitoring"      # Cross-namespace access!
+        operations:
+          - name: /health
+            httpVerb: ["GET"]
+            action: allow
+
+---
+# =============================================================================
+# Dapr Component: State Store (Redis)
+# =============================================================================
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: statestore
+  namespace: production
+spec:
+  type: state.redis
+  version: v1
+  metadata:
+    - name: redisHost
+      value: "redis-master.production.svc.cluster.local:6379"
+    - name: redisPassword
+      secretKeyRef:
+        name: redis-secret
+        key: password
+    - name: enableTLS
+      value: "true"                 # TLS to Redis too!
+
+---
+# =============================================================================
+# Dapr Component: Pub/Sub (RabbitMQ)
+# =============================================================================
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: pubsub
+  namespace: production
+spec:
+  type: pubsub.rabbitmq
+  version: v1
+  metadata:
+    - name: host
+      value: "amqps://rabbitmq.production.svc.cluster.local:5671"  # amqps = TLS
+    - name: durable
+      value: "true"
+    - name: deletedWhenUnused
+      value: "false"
+
+---
+# =============================================================================
+# cert-manager Certificate for Ingress (Let's Encrypt)
+# =============================================================================
+# This is for EXTERNAL traffic. Internal mTLS is handled by Dapr.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: order-service-ingress-tls
+  namespace: production
+spec:
+  secretName: order-service-ingress-tls
+  dnsNames:
+    - orders.api.example.com
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  duration: 2160h       # 90 days
+  renewBefore: 720h     # 30 days before expiry
+
+---
+# =============================================================================
+# Ingress (external access with Let's Encrypt TLS)
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: order-service-ingress
+  namespace: production
+  annotations:
+    # cert-manager will auto-create Certificate resource
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    # Route through Dapr sidecar
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+spec:
+  tls:
+    - hosts:
+        - orders.api.example.com
+      secretName: order-service-ingress-tls
+  rules:
+    - host: orders.api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: order-service
+                port:
+                  number: 80

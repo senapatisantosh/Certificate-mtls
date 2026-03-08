@@ -1,0 +1,24 @@
+{
+  "name": "acme-certificate-generator",
+  "version": "1.0.0",
+  "description": "Step-by-step Let's Encrypt ACME certificate generation in TypeScript",
+  "main": "dist/acme-certificate.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node src/acme-certificate.ts",
+    "local-certs": "ts-node src/acme-certificate.ts local --output ../certs",
+    "acme-dry-run": "ts-node src/acme-certificate.ts acme --domain api.example.com --email admin@example.com --dry-run",
+    "inspect": "ts-node src/acme-certificate.ts inspect --cert ../certs/server.crt"
+  },
+  "dependencies": {
+    "acme-client": "^5.4.0",
+    "commander": "^12.0.0",
+    "node-forge": "^1.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/node-forge": "^1.3.11",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}
